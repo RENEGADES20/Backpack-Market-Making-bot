@@ -1,0 +1,117 @@
+Market Maker Program
+Market makers on Backpack are eligible for maker rebates across spot and futures markets, and participate in a monthly equity reward pool valued at ~$195,000 for providing liquidity on perpetual futures markets.
+
+Overview
+Market makers on Backpack are eligible for maker rebates across spot and futures markets, and participate in a monthly equity reward pool valued at ~$195,000 for providing liquidity on perpetual futures markets.
+
+To be eligible for this program, please reach out to us at vip@backpack.exchange
+
+Market Maker Rebates
+
+Note: Values shown without a “%” symbol are expressed in basis points (bps).
+MM tiers can be reached either by Total Maker Share or Adjusted Maker Share, whichever is highest. The Adjusted Maker Share model rewards traders for providing liquidity on low liquidity markets. Each market has a multiplier (as presented below), which is used to calculate the Adjusted Volume.
+
+
+Adjusted maker share is calculated by dividing a user's total adjusted maker volume from that month by the total adjusted maker volume of all users across all markets in each instrument category.
+
+MMs can also unlock MM tiers through their Total Maker Share, which does not factor in market multipliers. For Total Maker Share, we take the user’s total maker volume and divide it by the total maker volume of all users across all markets in each instrument category without applying any multipliers.
+
+MM Tier Calculation and Payout
+On the last day of every month, we will calculate the Total Maker Share and Adjusted Maker Share for each user and choose the highest between the two to determine their MM tier / fees for the month. 
+
+Rebates will be credited manually to the user’s Backpack account the following month. In the meantime, users participating in the MM program will have their fee tier set to VIP2, which has 0 maker fees.
+
+Market Maker Monthly Rewards
+Backpack has allocated 5% of the company’s equity as of December 2023 to reward market makers that provide liquidity on the exchange. 2.5% has been allocated to spot and futures each, which nets to ~$195,000 in monthly rewards for each instrument (using our latest valuation of $120m as of February 2024).
+
+Spot rewards started on January 1 2024 and ended on December 31 2024. The futures program starts on February 1, 2025.
+
+Monthly Futures Reward Distribution
+
+Pair Categories
+
+Primary Pairs: BTC-PERP, ETH-PERP, and SOL-PERP
+
+Secondary Pairs: All other futures pairs
+
+Primary Pairs Distribution
+
+The total primary reward pool is split equally among BTC-PERP, ETH-PERP, and SOL-PERP. Each primary pair receives 0.03472% of the total reward pool.
+
+Secondary Pairs Distribution
+
+The reward for secondary pairs is distributed based on the number of days each pair was active during the month (the timestamp of first trade is considered the start). The formula is:
+
+Individual Pair Reward % = Pair's Active Days / Sum of All Pairs' Active Days
+
+Example
+
+Let's say we have three secondary pairs in a 30-day month:
+
+Pair A: Active for 30 days
+
+Pair B: Active for 30 days
+
+Pair C: Active for 10 days
+
+Total active days across all pairs = 70 days (30 + 30 + 10)
+
+Therefore:
+
+Pair A receives: (30/70) = 37.5% of secondary rewards
+
+Pair B receives: (30/70) = 37.5% of secondary rewards
+
+Pair C receives: (10/70) = 25% of secondary rewards
+
+Scoring System For Monthly Rewards
+To determine a user’s share of the reward pool for a given pair, we will look at their Blended Score, which takes into account their Volume Score and Liquidity Score.
+
+For each market:
+
+Volume Score = your maker volume / volume of all MMs in the program
+
+Liquidity Score = Your Liquidity Metric / Sum of all MMs Liquidity Metric
+
+Liquidity Metric = Average Size / (Average Spread) * Uptime Score
+
+Uptime Score = Active Snapshots / Total Snapshots
+
+Blended Score = (Volume Score * Volume Weight) + (Liquidity Score * Liquidity Weight)
+
+Reward = Blended Score * Monthly Reward Pool
+
+Volume Score has a weight of 0.8 and Liquidity Score 0.2.
+
+Optional Liquidity KPIs
+Market Makers (MMs) who maintain liquidity KPIs for at least 80% of the month will receive a 30% boost to both their Volume Score and Liquidity Score on the relevant pairs where they hit the KPI. This boost is taken from the allocation that would otherwise go to MMs who fall below the 80% uptime threshold.
+
+See optional liquidity KPIs below:
+
+
+The One-Sided Depth values shown above represent the minimum liquidity required on each side of the order book (bid and ask) independently. For example, a $10,000 depth requirement means market makers must maintain at least $10,000 worth of orders on both the buy side and the sell side separately, within the specified spread level.
+
+Note that the KPIs may change as volumes and liquidity on the exchange evolve. If a market doesn't have liquidity KPIs specified for it, the 30% rewards boost is not applicable for that market.
+
+MM Reward Calculation Example
+The example below illustrates how rewards are calculated for a single market.‍
+
+
+
+
+Further Information
+All new MMs will enjoy MM5 maker fees for their first month; thereafter, fees will be determined based on the user’s market share and volumes at the end of the fee holiday period. Backpack Exchange does not, and will not entertain special fee deals with any MM. Fee schedules with all MMs are the same.
+
+MMs participating in this program are not able to participate in other programs.
+
+MMs must receive at least 1% of the total allocation in order to be eligible for equity rewards in a given month. Additionally, MMs with an average size lower than $2000 or a volume score lower than 1.5% won't be eligible for rewards on a given market.
+
+For the liquidity score calculation, we will only consider orders placed within 100bps from the mid.
+
+For a limited time, each MM has the option to have Backpack buy back the awarded equity every month at the previous fundraise valuation ($120m as of February 2024). If a market maker wishes to receive their month’s reward in cash, the market maker must let Backpack know before the end of the following month. For example, a MM has until November 30 to state how they want to receive their October rewards. Previous equity rewards that have not been claimed in cash cannot be converted.
+
+MMs must comply with Backpack Exchange's User Agreement and all applicable policies and procedures.
+
+Backpack Exchange reserves the right to waive certain KPI requirements for a certain period of time in its sole discretion.
+
+Backpack Exchange reserves the right to modify this program any time when appropriate.
