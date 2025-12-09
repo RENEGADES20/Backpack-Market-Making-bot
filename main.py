@@ -1,17 +1,15 @@
 """
-Backpack 高频做市机器人 v2.0（单文件版）
+Backpack MM Tier Hunter v3.1  （单文件可直接运行）
 
-核心功能：
-1）动态选择二线永续合约（按 24h 成交量 / 深度 / spread）
-2）单边做市 + 动态切换 Bid / Ask 方向（基于 taker 订单流不平衡）
-3）下单规模 = 账户净权益百分比（支持滚仓复利）
-4）多维风控：短期振幅 + spread 熔断 + 仓位上限
-5）超仓位时，使用“限价 IOC 反向平仓”对冲超额部分，而不是粗暴市价
-6）WebSocket 自动重连，恢复订阅，稳定更新盘口和成交
-7）大量中文注释，适合你后续继续魔改
+在你 v3.0 的基础上做了这些改动：
+- ✅ 保留：Volume 最大化 / 单边高频 / 2 秒生命周期 / post-only / 订单流方向 / 动态选币框架
+- ✅ Backpack 原生 API：路径全部符合官方文档
+- ✅ 修复签名：bool 统一转 "true"/"false"，去掉 None 字段，避免 INVALID_CLIENT_REQUEST
+- ✅ 账户、仓位查询加缓存，减轻 API 压力
+- ✅ WS 只用公开流（bookTicker / trade），做盘口 & 订单流分析
 
-
-
+当前默认只做：SOL_USDC_PERP
+后面想开 Secondary Pairs，只需把 USE_DYNAMIC_SYMBOLS 改为 True
 """
 
 import asyncio
@@ -22,6 +20,7 @@ import os
 import time
 from collections import deque
 from decimal import Decimal
+from typing import Optional, Dict, List, Any
 
 import httpx
 import websockets
@@ -29,49 +28,79 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 # ============================================================
-#                      全局配置（需按需修改）
+#                    全局配置
 # ============================================================
 
 API_BASE_URL = "https://api.backpack.exchange"
 WS_URL = "wss://ws.backpack.exchange"
 
-# 这里按官方文档：X-API-KEY = base64 公钥，X-SIGNATURE 用 seed(私钥) 签
+# API 密钥（从环境变量读取）
 API_PUBLIC_KEY_B64 = os.environ.get("BPX_API_KEY", "")
 API_SECRET_SEED_B64 = os.environ.get("BPX_API_SECRET", "")
 
 if not API_PUBLIC_KEY_B64 or not API_SECRET_SEED_B64:
-    raise RuntimeError("请先设置环境变量 BPX_API_KEY（公钥）和 BPX_API_SECRET（seed 私钥，base64）")
+    raise RuntimeError(
+        "请先设置环境变量：\n"
+        "  BPX_API_KEY   = 公钥(base64)\n"
+        "  BPX_API_SECRET= 私钥 seed(base64)\n"
+        "可以在系统环境变量里设置，或者在运行前用：\n"
+        "  set BPX_API_KEY=...\n"
+        "  set BPX_API_SECRET=...\n"
+    )
 
-# ---------- 仓位与下单比例 ----------
-ORDER_SIZE_PCT = Decimal("0.005")     # 每笔下单 = 账户权益 * 0.5%
-MAX_EXPOSURE_PCT = Decimal("0.20")    # 总敞口 = 账户权益 * 20%
+# ============================================================
+# 🔥 核心优化 1: Volume Score 最大化
+# ============================================================
+ORDER_SIZE_PCT = Decimal("0.01")          # 每笔 1% 权益
+MAX_EXPOSURE_PCT = Decimal("0.15")         # 最大 15% 敞口
+MAX_ORDER_NOTIONAL = Decimal("30")         # 单笔上限 30 USDC
 
-MAX_ORDER_NOTIONAL = Decimal("25")    # 单笔名义最多 25U
+PRICE_OFFSET_TICKS = 0                     # 挂在 best
+MAX_ORDER_LIFETIME_SEC = 2.0               # 订单最大存活 2s
+MIN_ORDER_INTERVAL_SEC = 0.05              # 最小下单间隔 50ms
 
-MAX_ACTIVE_LIFETIME_SEC = 3.0         # 单笔挂单最多挂 3 秒
-PRICE_OFFSET_TICKS = 1                # 0=挂在 best；1=best±1tick
+# ============================================================
+# 🔥 核心优化 2: Secondary Pairs 动态选币（当前关闭）
+# ============================================================
+USE_DYNAMIC_SYMBOLS = False                # 先用固定合约跑通
+DEFAULT_SYMBOLS = ["SOL_USDC_PERP"]
 
-# ---------- 动态选币 ----------
-MIN_24H_VOL = Decimal("200000")       # 24h quoteVolume 下限（按 USDC 计）
-MAX_SPREAD_PCT = Decimal("0.015")     # spread < 1.5% 才做
-MIN_DEPTH = Decimal("5000")           # 买盘深度 > 5000U 才做（粗略）
-MAX_SYMBOLS = 5                       # 同时做市的合约数量
-DEPTH_LEVELS_FOR_FILTER = 10          # 用前多少档粗略估算深度
+SYMBOL_UPDATE_INTERVAL = 300               # 5 分钟更新一次
+MAX_SYMBOLS = 3
 
-# ---------- 多维风控 ----------
-MAX_SHORT_VOLAT_PCT = Decimal("0.006")    # 1秒内 mid 振幅 > 0.6% → 熔断
-MAX_SPREAD_RISK = Decimal("0.02")         # spread > 2% → 熔断
-COOLDOWN_SEC = 5                          # 熔断后冷静期
+MIN_24H_VOLUME = Decimal("100000")         # 24h 最小成交额
+MAX_SPREAD_PCT = Decimal("0.02")           # spread < 2%
+MIN_DEPTH_NOTIONAL = Decimal("3000")       # 买盘深度限制
 
-# ---------- taker-speed / 方向判断 ----------
-TRADE_LOOKBACK_SEC = 3.0                  # 回看过去 3 秒买卖不平衡
-IMBALANCE_THRESHOLD = Decimal("1.2")      # 买卖不平衡比例 1.2 倍才算有效信号
+EXCLUDED_SYMBOLS = [
+    "BTC_USDC_PERP",
+    "ETH_USDC_PERP",
+    # "SOL_USDC_PERP",   # 如果只想做二线，可以把 SOL 也排除
+]
 
-# 方向平滑相关
-IMBALANCE_EMA_ALPHA = Decimal("0.3")      # EMA 平滑系数（越大越敏感）
-MIN_SIDE_HOLD_SEC = 2.0                   # 方向切换最小间隔（秒）
+# ============================================================
+# 🔥 核心优化 3: 订单流驱动方向选择
+# ============================================================
+TRADE_LOOKBACK_SEC = 2.0                   # 回看 2 秒订单流
+IMBALANCE_THRESHOLD = Decimal("1.3")       # 不平衡阈值
+IMBALANCE_EMA_ALPHA = Decimal("0.4")       # EMA 平滑
+MIN_SIDE_HOLD_SEC = 1.5                    # 方向最短持有时间
 
-# ---------- 日志 ----------
+# ============================================================
+# 🔥 核心优化 4: 风控
+# ============================================================
+MAX_MICRO_VOLAT_PCT = Decimal("0.008")     # 1秒振幅阈值
+MAX_SPREAD_RISK = Decimal("0.025")         # spread 阈值
+COOLDOWN_SEC = 3                           # 熔断冷却时间
+
+HEDGE_TRIGGER_PCT = Decimal("0.8")         # 仓位达到 80% 最大敞口开始对冲
+HEDGE_RATIO = Decimal("0.6")               # 对冲超额部分的 60%
+
+# API 调用频率控制
+EQUITY_UPDATE_INTERVAL = 10.0              # 10 秒更新一次权益
+POSITION_UPDATE_INTERVAL = 3.0             # 3 秒更新一次仓位
+
+# 日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -79,11 +108,11 @@ logging.basicConfig(
 
 
 # ============================================================
-#                     签名相关工具函数（REST）
+#                     签名工具函数
 # ============================================================
 
-def load_private_key():
-    """从 Base64 的 Seed 恢复 ED25519 私钥（官方文档同款生成方式）。"""
+def load_private_key() -> ed25519.Ed25519PrivateKey:
+    """从 Base64 seed 加载 ED25519 私钥"""
     seed = base64.b64decode(API_SECRET_SEED_B64)
     return ed25519.Ed25519PrivateKey.from_private_bytes(seed)
 
@@ -95,36 +124,71 @@ def get_timestamp_ms() -> int:
     return int(time.time() * 1000)
 
 
-def build_signing_string(instruction: str, params: dict | None, timestamp: int, window: int) -> str:
+def _normalize_param_value(v: Any) -> str:
     """
-    Backpack 官方签名格式：
+    签名时统一格式：
+    - bool -> "true"/"false"
+    - Decimal -> 字符串（原样）
+    - 其它 -> str(v)
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, Decimal):
+        return str(v)
+    return str(v)
 
-    1）把 body 或 query 的 key/value 按字母序排序，拼成 query-string
-    2）前面加上 instruction=...
-    3）后面追加 &timestamp=...&window=...
 
-    instruction=<instruction>&k1=v1&k2=v2&timestamp=...&window=...
+def build_signing_string(
+    instruction: str,
+    params: Optional[Dict[str, Any]],
+    timestamp: int,
+    window: int = 5000,
+) -> str:
+    """
+    官方要求：
+    instruction=<instruction>&k1=v1&k2=v2&...&timestamp=...&window=...
+
+    注意：
+    - 参数按 key 字母序排序
+    - 不要包含 None 字段
+    - bool 用 "true"/"false"
     """
     params = params or {}
-    items = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    filtered = {k: v for k, v in params.items() if v is not None}
+
+    # 排序 + 拼接
+    items = "&".join(
+        f"{k}={_normalize_param_value(v)}"
+        for k, v in sorted(filtered.items())
+    )
+
     if items:
         base = f"instruction={instruction}&{items}"
     else:
         base = f"instruction={instruction}"
+
     base += f"&timestamp={timestamp}&window={window}"
     return base
 
 
-def sign(instruction: str, params: dict | None, timestamp: int, window: int) -> str:
-    msg = build_signing_string(instruction, params, timestamp, window).encode()
-    sig = PRIVATE_KEY.sign(msg)
+def sign_message(
+    instruction: str,
+    params: Optional[Dict[str, Any]],
+    timestamp: int,
+    window: int = 5000,
+) -> str:
+    sign_str = build_signing_string(instruction, params, timestamp, window)
+    sig = PRIVATE_KEY.sign(sign_str.encode())
     return base64.b64encode(sig).decode()
 
 
-def auth_headers(instruction: str, params: dict | None = None) -> dict:
+def auth_headers(
+    instruction: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
     ts = get_timestamp_ms()
     window = 5000
-    signature = sign(instruction, params, ts, window)
+    signature = sign_message(instruction, params, ts, window)
     return {
         "X-API-KEY": API_PUBLIC_KEY_B64,
         "X-TIMESTAMP": str(ts),
@@ -135,291 +199,177 @@ def auth_headers(instruction: str, params: dict | None = None) -> dict:
 
 
 # ============================================================
-#                 公共工具：精度处理 / 取整
+#                     工具函数
 # ============================================================
 
-def round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
-    """向下取整到 step 的整数倍。如 value=1.234, step=0.01 -> 1.23"""
+def round_down(value: Decimal, step: Decimal) -> Decimal:
     if step == 0:
         return value
     return (value // step) * step
 
 
+def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return default
+
+
 # ============================================================
-#                      符号级（单合约）状态
+#                     市场状态类
 # ============================================================
 
 class SymbolState:
-    """
-    记录每个合约的：
-    - 精度信息（tick / qty_step / min_qty）
-    - 实时盘口（best_bid / best_ask）
-    - mid 价格 / 时间（用于振幅检测）
-    - 当前挂单状态（id / side / price / ts）
-    - 当前仓位名义（用于风控）
-    - 近期成交数据（用于 taker-speed 分析）
-    - 订单流方向EMA & 当前偏好方向（Bid / Ask）
-    """
+    """单个合约的完整状态"""
 
     def __init__(self, symbol: str):
         self.symbol = symbol
 
         # 精度
-        self.tick: Decimal | None = None
-        self.qty_step: Decimal | None = None
-        self.min_qty: Decimal | None = None
+        self.tick: Optional[Decimal] = None
+        self.qty_step: Optional[Decimal] = None
+        self.min_qty: Optional[Decimal] = None
 
         # 盘口
-        self.best_bid: Decimal | None = None
-        self.best_ask: Decimal | None = None
+        self.best_bid: Optional[Decimal] = None
+        self.best_ask: Optional[Decimal] = None
+        self.last_mid: Optional[Decimal] = None
+        self.last_mid_ts: Optional[float] = None
 
-        # mid & 时间（用于短期振幅）
-        self.last_mid: Decimal | None = None
-        self.last_mid_ts: float | None = None
+        # 挂单状态
+        self.active_order_id: Optional[str] = None
+        self.active_order_side: Optional[str] = None
+        self.active_order_price: Optional[Decimal] = None
+        self.active_order_ts: Optional[float] = None
+        self.last_order_ts: Optional[float] = None
 
-        # 当前挂出的订单（只保留一个 quote）
-        self.active_order_id: str | None = None
-        self.active_order_side: str | None = None   # "Bid" or "Ask"
-        self.active_order_price: Decimal | None = None
-        self.active_order_ts: float | None = None
-
-        # 仓位名义
+        # 仓位 / 权益
         self.position_notional: Decimal = Decimal("0")
+        self.last_position_update: float = 0.0
 
-        # taker 成交历史：deque[(ts, side, notional)]
-        self.trades = deque()
+        self.cached_equity: Decimal = Decimal("1000")
+        self.last_equity_update: float = 0.0
 
-        # 是否处于熔断冷静期
-        self.cooldown_until: float = 0.0
-
-        # 订单流 EMA & 当前“策略方向”
-        self.imbalance_ema: Decimal | None = None
+        # 订单流（taker 不平衡）
+        self.trades: deque = deque()  # (ts, side, notional)
+        self.imbalance_ema: Optional[Decimal] = None
         self.preferred_side: str = "Bid"
         self.last_side_switch_ts: float = 0.0
 
-    # ----------------盘口与 mid 更新----------------
+        # 风控
+        self.cooldown_until: float = 0.0
 
+        # 统计
+        self.maker_volume_estimate: Decimal = Decimal("0")
+        self.orders_placed: int = 0
+        self.orders_cancelled: int = 0
+        self.orders_filled: int = 0
+        self.last_stats_print: float = 0.0
+
+    # 盘口 & 中价
     def update_mid(self):
-        if self.best_bid is not None and self.best_ask is not None:
-            mid = (self.best_bid + self.best_ask) / 2
-            self.last_mid = mid
+        if self.best_bid and self.best_ask:
+            self.last_mid = (self.best_bid + self.best_ask) / 2
             self.last_mid_ts = time.time()
 
-    # ----------------成交记录 & 不平衡----------------
-
-    def record_trade(self, side: str, price: Decimal, qty: Decimal):
-        """
-        记录一笔成交，用于计算短期买卖不平衡 & taker 速度
-
-        side:
-            "Buy"  = taker 买入
-            "Sell" = taker 卖出
-        """
+    # 订单流记录
+    def record_trade(self, taker_side: str, price: Decimal, qty: Decimal):
         notional = price * qty
-        self.trades.append((time.time(), side, notional))
+        self.trades.append((time.time(), taker_side, notional))
         cutoff = time.time() - TRADE_LOOKBACK_SEC
         while self.trades and self.trades[0][0] < cutoff:
             self.trades.popleft()
 
-    def taker_imbalance(self) -> Decimal:
-        """
-        返回最近 TRADE_LOOKBACK_SEC 秒内的买卖不平衡比：
-        buy_notional / sell_notional
-        """
+    def calc_imbalance(self) -> Decimal:
         buy_notional = Decimal("0")
         sell_notional = Decimal("0")
-        for ts, side, notional in self.trades:
+        for _, side, notional in self.trades:
             if side == "Buy":
                 buy_notional += notional
-            elif side == "Sell":
+            else:
                 sell_notional += notional
 
-        if sell_notional == 0 and buy_notional == 0:
-            return Decimal("1")
         if sell_notional == 0:
-            return Decimal("999")
+            return Decimal("999") if buy_notional > 0 else Decimal("1")
         return buy_notional / sell_notional
 
 
-MARKETS: dict[str, SymbolState] = {}
-ACTIVE_SYMBOLS: list[str] = []
+# 全局
+MARKETS: Dict[str, SymbolState] = {}
+ACTIVE_SYMBOLS: List[str] = []
 
 
 # ============================================================
-#              动态选 Secondary Pairs（按量/深度/spread）
+#                     API 调用
 # ============================================================
 
-async def select_symbols(client: httpx.AsyncClient):
-    """
-    使用官方：
-      - GET /api/v1/markets?marketType=PERP 拿到所有永续合约列表
-      - GET /api/v1/tickers 拿 24h volume/quoteVolume
-      - 对高成交额的合约，用 /api/v1/depth 估算 spread 和深度
-    """
-    global ACTIVE_SYMBOLS
-
-    try:
-        # 1) 所有 PERP 合约
-        resp_mk = await client.get(
-            f"{API_BASE_URL}/api/v1/markets",
-            params={"marketType": ["PERP"]},
-            timeout=5,
-        )
-        resp_mk.raise_for_status()
-        markets = resp_mk.json()
-    except Exception as e:
-        logging.error(f"获取 markets 失败: {e}")
-        return
-
-    perp_symbols: list[str] = []
-    for m in markets:
-        if m.get("marketType") != "PERP":
-            continue
-        if not m.get("visible", True):
-            continue
-        if m.get("orderBookState") != "Open":
-            continue
-        perp_symbols.append(m["symbol"])
-
-    if not perp_symbols:
-        logging.error("没有找到任何 PERP 合约")
-        return
-
-    # 2) 全部 24h tickers
-    try:
-        resp_tk = await client.get(f"{API_BASE_URL}/api/v1/tickers", timeout=5)
-        resp_tk.raise_for_status()
-        tickers = resp_tk.json()
-    except Exception as e:
-        logging.error(f"获取 tickers 失败: {e}")
-        return
-
-    # symbol -> quoteVolume
-    vol_map: dict[str, Decimal] = {}
-    for t in tickers:
-        sym = t["symbol"]
-        if sym in perp_symbols:
-            try:
-                vol = Decimal(t["quoteVolume"])
-            except Exception:
-                continue
-            vol_map[sym] = vol
-
-    # 先按 volume 预选一批，再看 spread & depth
-    candidates_by_vol = [
-        (s, v) for s, v in vol_map.items() if v >= MIN_24H_VOL
-    ]
-    if not candidates_by_vol:
-        logging.error("按照 MIN_24H_VOL 没选出合约，建议先调低 MIN_24H_VOL。")
-        return
-
-    candidates_by_vol.sort(key=lambda x: x[1], reverse=True)
-    shortlist = [s for s, _ in candidates_by_vol[:MAX_SYMBOLS * 5]]
-
-    final_candidates: list[tuple[str, Decimal]] = []
-
-    for sym in shortlist:
-        try:
-            resp_depth = await client.get(
-                f"{API_BASE_URL}/api/v1/depth",
-                params={"symbol": sym, "limit": "50"},
-                timeout=5,
-            )
-            resp_depth.raise_for_status()
-            ob = resp_depth.json()
-        except Exception as e:
-            logging.warning(f"[{sym}] 获取 depth 失败: {e}")
-            continue
-
-        bids = ob.get("bids") or []
-        asks = ob.get("asks") or []
-        if not bids or not asks:
-            continue
-
-        best_bid = Decimal(bids[0][0])
-        best_ask = Decimal(asks[0][0])
-        if best_bid <= 0 or best_ask <= 0:
-            continue
-
-        mid = (best_bid + best_ask) / 2
-        spread = (best_ask - best_bid) / mid
-
-        # 粗略计算前 DEPTH_LEVELS_FOR_FILTER 档买盘名义深度
-        depth_notional = Decimal("0")
-        for px_str, qty_str in bids[:DEPTH_LEVELS_FOR_FILTER]:
-            px = Decimal(px_str)
-            qty = Decimal(qty_str)
-            depth_notional += px * qty
-
-        if spread <= MAX_SPREAD_PCT and depth_notional >= MIN_DEPTH:
-            final_candidates.append((sym, vol_map.get(sym, Decimal("0"))))
-
-    if not final_candidates:
-        logging.error("动态选币：按 spread/depth 过滤后为空，可以调松阈值。")
-        return
-
-    final_candidates.sort(key=lambda x: x[1], reverse=True)
-    ACTIVE_SYMBOLS = [s for s, _ in final_candidates[:MAX_SYMBOLS]]
-    logging.info(f"动态选币完成，本轮做市合约：{ACTIVE_SYMBOLS}")
-
-
-# ============================================================
-#                   精度 / 下单 / 撤单 / 仓位
-# ============================================================
-
-async def fetch_filters(client: httpx.AsyncClient, symbol: str):
-    """
-    读取单一合约的 tickSize / stepSize / minQty
-    对应官方：GET /api/v1/market?symbol=...
-    """
+async def fetch_market_info(client: httpx.AsyncClient, symbol: str) -> bool:
+    """GET /api/v1/market 读取 tickSize / stepSize / minQty"""
     st = MARKETS[symbol]
     try:
         resp = await client.get(
             f"{API_BASE_URL}/api/v1/market",
             params={"symbol": symbol},
-            timeout=5,
+            timeout=10,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logging.error(f"[{symbol}] 获取 market 失败: {resp.status_code} {resp.text}")
+            return False
+
         data = resp.json()
+        st.tick = safe_decimal(data["filters"]["price"]["tickSize"])
+        st.qty_step = safe_decimal(data["filters"]["quantity"]["stepSize"])
+        st.min_qty = safe_decimal(data["filters"]["quantity"]["minQuantity"])
+
+        logging.info(
+            f"[{symbol}] 精度: tick={st.tick}, qty_step={st.qty_step}, min_qty={st.min_qty}"
+        )
+        return True
     except Exception as e:
-        logging.error(f"[{symbol}] 获取 market 失败: {e}")
-        return
-
-    price_filter = data["filters"]["price"]
-    qty_filter = data["filters"]["quantity"]
-
-    st.tick = Decimal(price_filter["tickSize"])
-    st.qty_step = Decimal(qty_filter["stepSize"])
-    st.min_qty = Decimal(qty_filter["minQuantity"])
-    logging.info(f"[{symbol}] tick={st.tick}, qty_step={st.qty_step}, min_qty={st.min_qty}")
+        logging.error(f"[{symbol}] 获取 market 异常: {e}")
+        return False
 
 
-async def get_account_equity(client: httpx.AsyncClient) -> Decimal:
-    """
-    使用 /api/v1/capital/collateral 里的 netEquity 作为账户总权益。
-    Instruction: collateralQuery
-    """
+async def get_equity(client: httpx.AsyncClient, st: SymbolState) -> Decimal:
+    """GET /api/v1/capital/collateral -> netEquity（带缓存）"""
+    now = time.time()
+    if now - st.last_equity_update < EQUITY_UPDATE_INTERVAL:
+        return st.cached_equity
+
     try:
-        headers = auth_headers("collateralQuery")
+        headers = auth_headers("collateralQuery", None)
         resp = await client.get(
             f"{API_BASE_URL}/api/v1/capital/collateral",
             headers=headers,
-            timeout=5,
+            timeout=10,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return Decimal(data["netEquity"])
+
+        if resp.status_code == 200:
+            data = resp.json()
+            # 文档里是对象，实际如果是数组你可以打印确认一下
+            # 这里保留你原来的写法：data["netEquity"]
+            equity = safe_decimal(data.get("netEquity", "1000"))
+            st.cached_equity = equity
+            st.last_equity_update = now
+            return equity
+        else:
+            logging.error(f"获取权益失败: {resp.status_code} {resp.text}")
     except Exception as e:
-        logging.error(f"获取账户权益失败（使用默认 1000U）: {e}")
-        return Decimal("1000")
+        logging.error(f"获取权益异常: {e}")
+
+    return st.cached_equity
 
 
-async def fetch_position_notional(client: httpx.AsyncClient, symbol: str) -> Decimal:
-    """
-    获取单一合约净仓位名义。
-    GET /api/v1/position?symbol=...
-    Instruction: positionQuery
-    """
+async def get_position(
+    client: httpx.AsyncClient,
+    symbol: str,
+    st: SymbolState
+) -> Decimal:
+    """GET /api/v1/position 带缓存，返回名义仓位绝对值"""
+    now = time.time()
+    if now - st.last_position_update < POSITION_UPDATE_INTERVAL:
+        return st.position_notional
+
     try:
         params = {"symbol": symbol}
         headers = auth_headers("positionQuery", params)
@@ -427,152 +377,175 @@ async def fetch_position_notional(client: httpx.AsyncClient, symbol: str) -> Dec
             f"{API_BASE_URL}/api/v1/position",
             params=params,
             headers=headers,
-            timeout=5,
+            timeout=10,
         )
+
+        if resp.status_code == 404:
+            st.position_notional = Decimal("0")
+            st.last_position_update = now
+            return st.position_notional
+
         if resp.status_code != 200:
-            return Decimal("0")
+            logging.warning(f"[{symbol}] 获取仓位非 200: {resp.status_code} {resp.text}")
+            return st.position_notional
+
         data = resp.json()
         if not data:
-            return Decimal("0")
-        pos = data[0]
-        net_qty = Decimal(pos["netQuantity"])
-        mark_price = Decimal(pos["markPrice"])
-        return abs(net_qty * mark_price)
+            st.position_notional = Decimal("0")
+        else:
+            pos = data[0]
+            net_qty = safe_decimal(pos.get("netQuantity", "0"))
+            mark = safe_decimal(pos.get("markPrice", "0"))
+            st.position_notional = abs(net_qty * mark)
+
+        st.last_position_update = now
+        return st.position_notional
+
     except Exception as e:
-        logging.error(f"[{symbol}] 获取仓位失败: {e}")
-        return Decimal("0")
+        logging.error(f"[{symbol}] 获取仓位异常: {e}")
+        return st.position_notional
 
 
-async def place_limit_order(
+async def place_order(
     client: httpx.AsyncClient,
     symbol: str,
     side: str,
     price: Decimal,
     qty: Decimal,
-    post_only: bool = True,
     reduce_only: bool = False,
-    tif: str = "GTC",
-) -> str | None:
-    """
-    下一个普通限价单：
-      side: "Bid" or "Ask"
-    对应官方：POST /api/v1/order, Instruction: orderExecute
-    """
+) -> Optional[str]:
+    """POST /api/v1/order 下限价单（post-only）"""
+    st = MARKETS[symbol]
+
+    now = time.time()
+    if st.last_order_ts and now - st.last_order_ts < MIN_ORDER_INTERVAL_SEC:
+        return None
+
     body = {
         "symbol": symbol,
-        "side": side,
+        "side": side,                 # "Bid" / "Ask"
         "orderType": "Limit",
         "price": str(price),
         "quantity": str(qty),
-        "timeInForce": tif,
-        "postOnly": post_only,
+        "timeInForce": "GTC",
+        "postOnly": True,             # 只做 maker
         "reduceOnly": reduce_only,
     }
+
     headers = auth_headers("orderExecute", body)
+
     try:
         resp = await client.post(
             f"{API_BASE_URL}/api/v1/order",
             json=body,
             headers=headers,
-            timeout=5,
+            timeout=10,
         )
-        resp.raise_for_status()
+
+        if resp.status_code != 200:
+            logging.error(
+                f"[{symbol}] 下单失败: {resp.status_code} {resp.text}"
+            )
+            return None
+
         data = resp.json()
-        order_id = data["id"]
-        logging.info(f"[{symbol}] 下单成功 side={side}, px={price}, qty={qty}, id={order_id}")
+        order_id = data.get("id")
+        st.orders_placed += 1
+        st.last_order_ts = now
+
+        logging.info(f"[{symbol}] 下单成功: {side} {qty}@{price}, id={order_id}")
         return order_id
+
     except Exception as e:
-        logging.error(f"[{symbol}] 下单失败: {e}")
+        logging.error(f"[{symbol}] 下单异常: {e}")
         return None
 
 
-async def cancel_all_open_orders(client: httpx.AsyncClient, symbol: str):
-    """
-    撤掉该合约的所有 RestingLimitOrder
-    对应官方：DELETE /api/v1/orders, Instruction: orderCancelAll
-    """
+async def cancel_orders(client: httpx.AsyncClient, symbol: str):
+    """DELETE /api/v1/orders 撤销 RestingLimitOrder"""
     st = MARKETS[symbol]
     body = {
         "symbol": symbol,
         "orderType": "RestingLimitOrder",
     }
     headers = auth_headers("orderCancelAll", body)
+
     try:
-        await client.delete(
+        resp = await client.request(
+            "DELETE",
             f"{API_BASE_URL}/api/v1/orders",
-            json=body,
+            json=body,  # DELETE 用 request 才能携带 json
             headers=headers,
-            timeout=5,
+            timeout=10,
         )
-        st.active_order_id = None
-        st.active_order_side = None
-        st.active_order_price = None
-        st.active_order_ts = None
-        logging.info(f"[{symbol}] 已撤掉所有挂单")
+        if resp.status_code in (200, 202):
+            st.active_order_id = None
+            st.active_order_side = None
+            st.active_order_price = None
+            st.active_order_ts = None
+            st.orders_cancelled += 1
+        else:
+            logging.warning(f"[{symbol}] 撤单返回: {resp.status_code} {resp.text}")
+
     except Exception as e:
-        logging.error(f"[{symbol}] 撤单失败: {e}")
+        logging.error(f"[{symbol}] 撤单异常: {e}")
 
 
 # ============================================================
-#                熔断风控：振幅 + spread
+#                     风控 & 对冲
 # ============================================================
 
-def risk_triggered(st: SymbolState) -> bool:
+def check_risk(st: SymbolState) -> bool:
+    """振幅 / spread 熔断"""
     now = time.time()
 
-    # 冷静期没过，直接认为风险中
     if now < st.cooldown_until:
         return True
 
-    if st.best_bid is None or st.best_ask is None:
+    if not st.best_bid or not st.best_ask:
         return True
 
     mid = (st.best_bid + st.best_ask) / 2
     if mid <= 0:
         return True
 
-    # 短期振幅
-    if st.last_mid is not None and st.last_mid_ts is not None:
+    # 1 秒内振幅
+    if st.last_mid and st.last_mid_ts:
         dt = now - st.last_mid_ts
         if dt < 1.0:
             change = abs(mid - st.last_mid) / st.last_mid
-            if change >= MAX_SHORT_VOLAT_PCT:
-                logging.warning(f"[{st.symbol}] 熔断：1秒内振幅过大={change:.2%}")
+            if change >= MAX_MICRO_VOLAT_PCT:
+                logging.warning(
+                    f"[{st.symbol}] 振幅熔断: {change:.2%}"
+                )
                 st.cooldown_until = now + COOLDOWN_SEC
                 return True
 
     # spread 风险
     spread = (st.best_ask - st.best_bid) / mid
     if spread >= MAX_SPREAD_RISK:
-        logging.warning(f"[{st.symbol}] 熔断：spread过大={spread:.2%}")
+        logging.warning(
+            f"[{st.symbol}] Spread熔断: {spread:.2%}"
+        )
         st.cooldown_until = now + COOLDOWN_SEC
         return True
 
     return False
 
 
-# ============================================================
-#          仓位超限时的“限价反向平仓”逻辑（改进版）
-# ============================================================
+async def hedge_if_needed(
+    client: httpx.AsyncClient,
+    symbol: str,
+    st: SymbolState,
+    equity: Decimal,
+):
+    """仓位超过一定比例，做 IOC reduce-only 对冲"""
+    max_allowed = equity * MAX_EXPOSURE_PCT
+    trigger_level = max_allowed * HEDGE_TRIGGER_PCT
 
-async def hedge_inventory(client: httpx.AsyncClient, symbol: str, st: SymbolState, equity: Decimal):
-    """
-    对冲逻辑要点：
-    1）先通过 /position 获取真实 netQuantity（含方向）
-    2）计算当前仓位名义 notional = |net_qty * mark|
-    3）如果低于上限，不对冲
-    4）只对冲“超额部分”的一部分（例如 50%），避免来回打满仓
-    5）对冲用：
-        - 多头超额：挂 Ask 在 best_bid 附近
-        - 空头超额：挂 Bid 在 best_ask 附近
-       使用限价 IOC，尽量吃到当前盘口，但避免挂残单太久
-    """
-
-    # 没有盘口不对冲
-    if st.best_bid is None or st.best_ask is None:
+    if st.position_notional < trigger_level:
         return
 
-    # === Step 1: 获取真实仓位（方向 + 名义） ===
     try:
         params = {"symbol": symbol}
         headers = auth_headers("positionQuery", params)
@@ -580,131 +553,93 @@ async def hedge_inventory(client: httpx.AsyncClient, symbol: str, st: SymbolStat
             f"{API_BASE_URL}/api/v1/position",
             params=params,
             headers=headers,
-            timeout=5,
+            timeout=10,
         )
-        resp.raise_for_status()
+
+        if resp.status_code != 200:
+            return
+
         data = resp.json()
         if not data:
             return
+
         pos = data[0]
-        net_qty = Decimal(pos["netQuantity"])     # 正 = 多，负 = 空
-        mark = Decimal(pos["markPrice"])
-    except Exception as e:
-        logging.error(f"[{symbol}] 对冲时获取仓位失败: {e}")
-        return
+        net_qty = safe_decimal(pos.get("netQuantity", "0"))
+        mark = safe_decimal(pos.get("markPrice", "0"))
+        if net_qty == 0:
+            return
 
-    # 名义
-    notional = abs(net_qty * mark)
-    if notional <= 0:
-        return
+        notional = abs(net_qty * mark)
+        excess = notional - max_allowed
+        if excess <= 0:
+            return
 
-    # === Step 2: 根据“超额部分”决定对冲量 ===
-    max_allowed = equity * MAX_EXPOSURE_PCT
-    excess = notional - max_allowed
+        hedge_notional = excess * HEDGE_RATIO
 
-    # 只有超出上限才对冲
-    if excess <= 0:
-        return
+        side = "Ask" if net_qty > 0 else "Bid"
+        ref_price = st.best_bid if side == "Ask" else st.best_ask
+        if ref_price <= 0:
+            return
 
-    # 只对冲超出的部分（更合理）
-    hedge_notional = excess * Decimal("0.5")   # 对冲 50% 超额（可调）
-    # 最小对冲量限制
-    if hedge_notional < Decimal("5"):
-        return
+        qty = round_down(hedge_notional / ref_price, st.qty_step or Decimal("0.01"))
+        if st.min_qty and qty < st.min_qty:
+            return
 
-    # === Step 3: 根据方向决定对冲方向 ===
-    if net_qty > 0:
-        # 多头 → 卖出（Ask）
-        side = "Ask"
-        ref_price = st.best_bid  # 挂在买一最容易成交
-    else:
-        # 空头 → 买入（Bid）
-        side = "Bid"
-        ref_price = st.best_ask  # 挂在卖一最容易成交
-
-    # === Step 4: 换算成数量 ===
-    if ref_price <= 0:
-        return
-
-    qty_raw = hedge_notional / ref_price
-    qty = round_down_to_step(qty_raw, st.qty_step or Decimal("0.001"))
-    if st.min_qty and qty < st.min_qty:
-        return
-
-    # === Step 5: 下限价 IOC（许多专业团队使用的方式） ===
-    await place_limit_order(
-        client,
-        symbol,
-        side=side,
-        price=ref_price,
-        qty=qty,
-        post_only=False,
-        reduce_only=True,
-        tif="IOC",
-    )
-
-    logging.warning(
-        f"[{symbol}] 对冲方向={side}, 仓位名义={notional}, "
-        f"超额={excess}, 对冲名义={hedge_notional}, qty={qty}"
-    )
-
-
-# ============================================================
-#     方向选择：基于 taker 订单流 + EMA + 滞回 + 最小持有时间
-# ============================================================
-
-def _update_imbalance_ema(st: SymbolState) -> Decimal:
-    """
-    用 EMA 平滑最近一段时间的买卖不平衡：
-    ema = alpha * 当前值 + (1-alpha) * 旧 ema
-    """
-    raw = st.taker_imbalance()
-    if st.imbalance_ema is None:
-        st.imbalance_ema = raw
-    else:
-        st.imbalance_ema = (
-            IMBALANCE_EMA_ALPHA * raw +
-            (Decimal("1") - IMBALANCE_EMA_ALPHA) * st.imbalance_ema
+        body = {
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "price": str(ref_price),
+            "quantity": str(qty),
+            "timeInForce": "IOC",
+            "postOnly": False,
+            "reduceOnly": True,
+        }
+        headers = auth_headers("orderExecute", body)
+        await client.post(
+            f"{API_BASE_URL}/api/v1/order",
+            json=body,
+            headers=headers,
+            timeout=10,
         )
-    return st.imbalance_ema
 
+        logging.warning(
+            f"[{symbol}] 对冲: {side} {qty}@{ref_price} | notional={notional:.2f}, excess={excess:.2f}"
+        )
+
+    except Exception as e:
+        logging.error(f"[{symbol}] 对冲异常: {e}")
+
+
+# ============================================================
+#                 方向选择（订单流驱动）
+# ============================================================
 
 def choose_side(st: SymbolState) -> str:
-    """
-    返回当前应该挂单的方向："Bid" 或 "Ask"
-
-    逻辑：
-    1）先计算 taker 买/卖 notional 比例（买/卖）
-    2）用 EMA 平滑，避免单个大单瞬时改变方向
-    3）如果 EMA > IMBALANCE_THRESHOLD，说明买盘吃得多 → 我们挂 Ask（卖给他们）
-       如果 EMA < 1/IMBALANCE_THRESHOLD，说明卖盘吃得多 → 我们挂 Bid
-       中间区域视为“中性”，直接保持原方向
-    4）加入最小持有时间 MIN_SIDE_HOLD_SEC，避免来回切方向抖动
-    """
+    """根据 taker 不平衡决定挂 Bid 还是 Ask"""
     now = time.time()
-    ema = _update_imbalance_ema(st)
+    imb = st.calc_imbalance()
 
-    if ema is None:
-        return st.preferred_side
+    if st.imbalance_ema is None:
+        st.imbalance_ema = imb
+    else:
+        alpha = IMBALANCE_EMA_ALPHA
+        st.imbalance_ema = alpha * imb + (Decimal("1") - alpha) * st.imbalance_ema
 
     upper = IMBALANCE_THRESHOLD
     lower = Decimal("1") / IMBALANCE_THRESHOLD
 
-    # 先根据 EMA 得出“建议方向”
-    if ema >= upper:
-        suggested = "Ask"  # 买盘强 → 卖给他们
-    elif ema <= lower:
-        suggested = "Bid"  # 卖盘强 → 接他们的卖
+    if st.imbalance_ema >= upper:
+        suggested = "Ask"  # 买盘强 -> 卖给他们
+    elif st.imbalance_ema <= lower:
+        suggested = "Bid"  # 卖盘强 -> 接他们
     else:
-        # 落在中性区间：直接保持原方向
         return st.preferred_side
 
-    # 如果建议方向与当前方向不同，再看是否满足最小持有时间
     if suggested != st.preferred_side:
         if now - st.last_side_switch_ts >= MIN_SIDE_HOLD_SEC:
             logging.info(
-                f"[{st.symbol}] 方向切换：{st.preferred_side} -> {suggested}, "
-                f"imbalance_ema={ema:.2f}"
+                f"[{st.symbol}] 方向切换: {st.preferred_side} -> {suggested}, EMA={st.imbalance_ema:.2f}"
             )
             st.preferred_side = suggested
             st.last_side_switch_ts = now
@@ -713,146 +648,205 @@ def choose_side(st: SymbolState) -> str:
 
 
 # ============================================================
-#                  单合约做市主循环
+#                 动态选币（保留功能，当前关闭）
+# ============================================================
+
+async def select_secondary_pairs(client: httpx.AsyncClient) -> List[str]:
+    """选出适合刷量的 PERP 市场（当前默认不用）"""
+    try:
+        resp = await client.get(
+            f"{API_BASE_URL}/api/v1/markets",
+            params={"marketType": ["PERP"]},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        markets = resp.json()
+
+        perp_symbols = [
+            m["symbol"]
+            for m in markets
+            if m.get("marketType") == "PERP"
+            and m.get("visible", True)
+            and m.get("orderBookState") == "Open"
+            and m["symbol"] not in EXCLUDED_SYMBOLS
+        ]
+
+        resp = await client.get(f"{API_BASE_URL}/api/v1/tickers", timeout=10)
+        resp.raise_for_status()
+        tickers = resp.json()
+
+        vol_map: Dict[str, Decimal] = {}
+        for t in tickers:
+            sym = t["symbol"]
+            if sym in perp_symbols:
+                vol = safe_decimal(t.get("quoteVolume", "0"))
+                if vol >= MIN_24H_VOLUME:
+                    vol_map[sym] = vol
+
+        if not vol_map:
+            logging.warning("动态选币：没有符合 24h volume 条件的合约，fallback SOL_USDC_PERP")
+            return ["SOL_USDC_PERP"]
+
+        candidates = []
+        for sym, vol in sorted(vol_map.items(), key=lambda x: x[1], reverse=True)[: MAX_SYMBOLS * 3]:
+            try:
+                d = await client.get(
+                    f"{API_BASE_URL}/api/v1/depth",
+                    params={"symbol": sym, "limit": "20"},
+                    timeout=5,
+                )
+                if d.status_code != 200:
+                    continue
+                ob = d.json()
+                bids = ob.get("bids", [])
+                asks = ob.get("asks", [])
+                if not bids or not asks:
+                    continue
+                best_bid = safe_decimal(bids[0][0])
+                best_ask = safe_decimal(asks[0][0])
+                mid = (best_bid + best_ask) / 2
+                if mid <= 0:
+                    continue
+                spread = (best_ask - best_bid) / mid
+                if spread > MAX_SPREAD_PCT:
+                    continue
+                depth = sum(
+                    safe_decimal(p) * safe_decimal(q)
+                    for p, q in bids[:10]
+                )
+                if depth < MIN_DEPTH_NOTIONAL:
+                    continue
+                candidates.append((sym, vol))
+            except Exception:
+                continue
+
+        if not candidates:
+            logging.warning("动态选币：spread/depth 过滤后为空，fallback SOL_USDC_PERP")
+            return ["SOL_USDC_PERP"]
+
+        selected = [s for s, _ in candidates[:MAX_SYMBOLS]]
+        logging.info(f"动态选币：{selected}")
+        return selected
+
+    except Exception as e:
+        logging.error(f"动态选币异常: {e}")
+        return ["SOL_USDC_PERP"]
+
+
+# ============================================================
+#                     做市主循环
 # ============================================================
 
 async def maker_loop(symbol: str):
     st = MARKETS[symbol]
 
     async with httpx.AsyncClient() as client:
-        # 初始化精度
-        await fetch_filters(client, symbol)
+        ok = await fetch_market_info(client, symbol)
+        if not ok:
+            logging.error(f"[{symbol}] 初始化失败，退出 maker_loop")
+            return
+
+        equity = await get_equity(client, st)
+        logging.info(f"[{symbol}] 启动做市，初始权益={equity:.2f} USDC")
 
         while True:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)  # 20Hz
 
-            # 没盘口 or 没精度，等待 WS/REST 初始化
-            if st.best_bid is None or st.best_ask is None or st.tick is None:
+            if not st.best_bid or not st.best_ask or not st.tick:
                 continue
 
-            # 更新 mid 用于振幅风控
             st.update_mid()
 
-            # 风控熔断：振幅 / spread
-            if risk_triggered(st):
-                await cancel_all_open_orders(client, symbol)
+            if check_risk(st):
+                await cancel_orders(client, symbol)
                 continue
 
-            # 账户权益 & 仓位名义
-            equity = await get_account_equity(client)
-            max_exposure = equity * MAX_EXPOSURE_PCT
+            equity = await get_equity(client, st)
+            pos_notional = await get_position(client, symbol, st)
 
-            st.position_notional = await fetch_position_notional(client, symbol)
+            await hedge_if_needed(client, symbol, st, equity)
 
-            # 如果已经超过最大敞口，上锁 + 对冲
-            if st.position_notional >= max_exposure:
-                logging.warning(
-                    f"[{symbol}] 仓位名义 {st.position_notional} 超过最大敞口 {max_exposure}，执行对冲。"
-                )
-                await cancel_all_open_orders(client, symbol)
-                await hedge_inventory(client, symbol, st, equity)
-                continue
-
-            # 通过订单流 EMA 决定当前策略方向
             side = choose_side(st)
 
-            # 下单名义（封顶）
-            target_notional = equity * ORDER_SIZE_PCT
-            if target_notional > MAX_ORDER_NOTIONAL:
-                target_notional = MAX_ORDER_NOTIONAL
+            target_notional = min(equity * ORDER_SIZE_PCT, MAX_ORDER_NOTIONAL)
 
-            # 根据方向选择参考价格
             ref_price = st.best_bid if side == "Bid" else st.best_ask
             if ref_price <= 0:
                 continue
 
-            # 计算数量并按 step 向下取整
-            raw_qty = target_notional / ref_price
-            qty = round_down_to_step(raw_qty, st.qty_step or Decimal("0.001"))
+            qty = round_down(target_notional / ref_price, st.qty_step or Decimal("0.01"))
             if st.min_qty and qty < st.min_qty:
                 continue
 
-            # 价格按 tick 偏移
+            # 挂在 best ± PRICE_OFFSET_TICKS
             if side == "Bid":
                 px = ref_price - st.tick * PRICE_OFFSET_TICKS
             else:
                 px = ref_price + st.tick * PRICE_OFFSET_TICKS
-            px = round_down_to_step(px, st.tick)
+            px = round_down(px, st.tick)
 
             now = time.time()
 
-            # 当前没有挂单 → 直接挂
             if st.active_order_id is None:
-                order_id = await place_limit_order(
-                    client, symbol, side=side, price=px, qty=qty, post_only=True
-                )
-                if order_id:
-                    st.active_order_id = order_id
+                oid = await place_order(client, symbol, side, px, qty)
+                if oid:
+                    st.active_order_id = oid
                     st.active_order_side = side
                     st.active_order_price = px
                     st.active_order_ts = now
                 continue
 
-            # 如果行情偏离我们挂单价格 >= 1 tick，撤单重挂
-            price_shift = abs(st.active_order_price - ref_price)
-            if price_shift >= st.tick:
-                await cancel_all_open_orders(client, symbol)
-                continue
+            price_moved = abs(st.active_order_price - ref_price) >= st.tick
+            timeout = now - (st.active_order_ts or now) > MAX_ORDER_LIFETIME_SEC
 
-            # 如果挂单已经挂太久，撤单重挂
-            if now - (st.active_order_ts or now) > MAX_ACTIVE_LIFETIME_SEC:
-                await cancel_all_open_orders(client, symbol)
-                continue
+            if price_moved or timeout:
+                await cancel_orders(client, symbol)
+
+            # 每 5 分钟打一份简单统计
+            if now - st.last_stats_print >= 300:
+                st.last_stats_print = now
+                spread = (st.best_ask - st.best_bid) / ((st.best_ask + st.best_bid) / 2)
+                logging.info(
+                    f"[{symbol}] 统计：下单={st.orders_placed}, 撤单={st.orders_cancelled}, "
+                    f"估算 maker 成交={st.orders_filled}, "
+                    f"仓位={pos_notional:.2f}, 权益={equity:.2f}, "
+                    f"方向={side}, EMA={st.imbalance_ema or 0:.2f}, spread={spread:.3%}"
+                )
 
 
 # ============================================================
-#                 WebSocket：订单簿 + 成交数据
-#              （自动重连 + 重新订阅 + 仅公有流）
+#                     WebSocket 处理
 # ============================================================
 
-async def ws_loop():
-    """
-    使用官方 WS：
-      - 订阅 bookTicker.<symbol> 拿 best bid/ask
-      - 订阅 trade.<symbol> 拿成交（用 m 推导 taker 买卖方向）
-
-    所有消息外层格式：{"stream": "...", "data": {...}}
-
-    这里做了：
-    - 自动重连（指数退避）
-    - 每次重连后自动重新订阅当前 ACTIVE_SYMBOLS 的所有流
-    """
+async def ws_handler():
     if not ACTIVE_SYMBOLS:
         logging.error("WS 启动失败：ACTIVE_SYMBOLS 为空")
         return
 
-    # 要订阅的所有流
-    def build_streams():
-        streams: list[str] = []
+    def build_streams() -> List[str]:
+        s: List[str] = []
         for sym in ACTIVE_SYMBOLS:
-            streams.append(f"bookTicker.{sym}")
-            streams.append(f"trade.{sym}")
-        return streams
+            s.append(f"bookTicker.{sym}")
+            s.append(f"trade.{sym}")
+        return s
 
-    backoff = 1  # 指数退避起始秒数
+    backoff = 1
 
     while True:
-        streams = build_streams()
         try:
             async with websockets.connect(
                 WS_URL,
                 ping_interval=60,
                 ping_timeout=120,
             ) as ws:
-                logging.info(f"WS 连接成功，订阅流: {streams}")
+                streams = build_streams()
+                logging.info(f"WS 已连接，订阅: {streams}")
 
-                sub_msg = {
+                await ws.send(json.dumps({
                     "method": "SUBSCRIBE",
                     "params": streams,
-                }
-                await ws.send(json.dumps(sub_msg))
+                }))
 
-                # 连接成功则重置退避
                 backoff = 1
 
                 async for raw in ws:
@@ -861,78 +855,96 @@ async def ws_loop():
                     except Exception:
                         continue
 
-                    # 官方所有流都有 {"stream": "...", "data": {...}} 外壳
                     data = msg.get("data", msg)
                     etype = data.get("e")
                     symbol = data.get("s")
-
                     if not symbol or symbol not in MARKETS:
                         continue
+
                     st = MARKETS[symbol]
 
                     if etype == "bookTicker":
-                        # 订单簿最优价
-                        st.best_bid = Decimal(data["b"])
-                        st.best_ask = Decimal(data["a"])
+                        st.best_bid = safe_decimal(data.get("b"))
+                        st.best_ask = safe_decimal(data.get("a"))
 
                     elif etype == "trade":
-                        # trade 流字段：
-                        #  p: 价格, q: 数量, m: 是否 buyer 是 maker
-                        #  我们要的是 taker 方向：
-                        #   m=True  -> buyer 是 maker -> 卖方是 taker -> taker = "Sell"
-                        #   m=False -> buyer 是 taker -> taker = "Buy"
-                        price = Decimal(data["p"])
-                        qty = Decimal(data["q"])
-                        buyer_is_maker = bool(data["m"])
-                        taker_side = "Sell" if buyer_is_maker else "Buy"
+                        price = safe_decimal(data.get("p"))
+                        qty = safe_decimal(data.get("q"))
+                        is_buyer_maker = data.get("m", False)
+                        taker_side = "Sell" if is_buyer_maker else "Buy"
                         st.record_trade(taker_side, price, qty)
 
+                        # 如果成交价接近我们挂的价，粗略当作成交一次
+                        if st.active_order_price and st.tick:
+                            if abs(price - st.active_order_price) < st.tick:
+                                st.orders_filled += 1
+                                st.maker_volume_estimate += price * qty
+
         except Exception as e:
-            logging.error(f"WS 连接异常：{e}，将在 {backoff} 秒后重连...")
+            logging.error(f"WS 断开: {e}，{backoff}s 后重连")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)  # 退避上限 60 秒
+            backoff = min(backoff * 2, 60)
 
 
 # ============================================================
-#                    周期性动态选币任务
-#         （目前只更新 ACTIVE_SYMBOLS，不热切换 loop）
+#                 选币更新任务（当前关闭）
 # ============================================================
 
-async def periodic_symbol_update():
+async def symbol_updater():
+    if not USE_DYNAMIC_SYMBOLS:
+        # 关闭就挂个死循环，避免报错
+        while True:
+            await asyncio.sleep(3600)
+        # 不会到这里
     async with httpx.AsyncClient() as client:
         while True:
-            await asyncio.sleep(600)  # 每 10 分钟尝试更新一次选币
-            await select_symbols(client)
-            logging.info("动态选币刷新完成（当前版本未热切换 maker_loop，仅更新 ACTIVE_SYMBOLS 配置）")
+            await asyncio.sleep(SYMBOL_UPDATE_INTERVAL)
+            logging.info("动态选币任务：刷新 Secondary Pairs...")
+            new_syms = await select_secondary_pairs(client)
+            # 简单策略：只添加新币，不移除旧币（保守）
+            for s in new_syms:
+                if s not in ACTIVE_SYMBOLS:
+                    ACTIVE_SYMBOLS.append(s)
+                    MARKETS[s] = SymbolState(s)
+                    asyncio.create_task(maker_loop(s))
+                    logging.info(f"新增做市市场: {s}")
 
 
 # ============================================================
-#                         启动入口
+#                     主函数
 # ============================================================
 
 async def main():
-    # 先跑一次选币
-    async with httpx.AsyncClient() as client:
-        await select_symbols(client)
+    global ACTIVE_SYMBOLS
 
-    if not ACTIVE_SYMBOLS:
-        logging.error("没有筛选出合适的合约，检查 MIN_24H_VOL / MAX_SPREAD_PCT / MIN_DEPTH 等参数。")
-        return
+    logging.info("=" * 60)
+    logging.info("Backpack MM Tier Hunter v3.1 启动")
+    logging.info("=" * 60)
 
-    # 为每个合约创建状态
+    if USE_DYNAMIC_SYMBOLS:
+        logging.info("模式：动态选币")
+        async with httpx.AsyncClient() as client:
+            ACTIVE_SYMBOLS = await select_secondary_pairs(client)
+    else:
+        logging.info("模式：固定合约")
+        ACTIVE_SYMBOLS = DEFAULT_SYMBOLS
+
     for sym in ACTIVE_SYMBOLS:
         MARKETS[sym] = SymbolState(sym)
 
-    # 启动 WS、maker 循环和选币更新任务
-    ws_task = asyncio.create_task(ws_loop())
-    maker_tasks = [asyncio.create_task(maker_loop(sym)) for sym in ACTIVE_SYMBOLS]
-    symbol_update_task = asyncio.create_task(periodic_symbol_update())
+    logging.info(f"初始做市合约: {ACTIVE_SYMBOLS}")
+    logging.info("=" * 60)
 
-    await asyncio.gather(ws_task, *maker_tasks, symbol_update_task)
+    tasks = [
+        asyncio.create_task(ws_handler()),
+        asyncio.create_task(symbol_updater()),
+        *[asyncio.create_task(maker_loop(sym)) for sym in ACTIVE_SYMBOLS],
+    ]
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Stopped by user.")
+        print("\n程序已停止")
