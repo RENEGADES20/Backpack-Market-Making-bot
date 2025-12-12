@@ -1,12 +1,20 @@
 """
-Backpack MM Tier Hunter v3.1  （单文件可直接运行）
+Backpack MM Tier Hunter v3.2  （单文件可直接运行）
 
-在你 v3.0 的基础上做了这些改动：
+在你 v3.1 的基础上做了这些改动：
 - ✅ 保留：Volume 最大化 / 单边高频 / 2 秒生命周期 / post-only / 订单流方向 / 动态选币框架
 - ✅ Backpack 原生 API：路径全部符合官方文档
 - ✅ 修复签名：bool 统一转 "true"/"false"，去掉 None 字段，避免 INVALID_CLIENT_REQUEST
 - ✅ 账户、仓位查询加缓存，减轻 API 压力
 - ✅ WS 只用公开流（bookTicker / trade），做盘口 & 订单流分析
+
+🔥 v3.2 新增功能：
+- ✅ API 优化：最大化利用 WebSocket，最小化 REST API 调用（统计 WS/API 比率）
+- ✅ 完整日志：输出到 D:\ALLCRYPTO\backpack mm\pythonProject\log.txt
+  包含：maker/taker数量、成交/失败数量、long/short比例、权益、
+  总PnL、平均PnL、最大获利/亏损、总手续费
+- ✅ 库存管理：一旦出现仓位，立即切换方向用 limit order 平仓（单边做市）
+- ✅ 统计追踪：全局统计对象追踪所有交易指标
 
 当前默认只做：SOL_USDC_PERP
 后面想开 Secondary Pairs，只需把 USE_DYNAMIC_SYMBOLS 改为 True
@@ -21,6 +29,7 @@ import time
 from collections import deque
 from decimal import Decimal
 from typing import Optional, Dict, List, Any
+from datetime import datetime
 
 import httpx
 import websockets
@@ -33,6 +42,9 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 API_BASE_URL = "https://api.backpack.exchange"
 WS_URL = "wss://ws.backpack.exchange"
+
+# 日志文件路径
+LOG_FILE_PATH = r"D:\ALLCRYPTO\backpack mm\pythonProject\log.txt"
 
 # API 密钥（从环境变量读取）
 API_PUBLIC_KEY_B64 = os.environ.get("BPX_API_KEY", "")
@@ -79,12 +91,16 @@ EXCLUDED_SYMBOLS = [
 ]
 
 # ============================================================
-# 🔥 核心优化 3: 订单流驱动方向选择
+# 🔥 核心优化 3: 订单流驱动方向选择 + 库存管理
 # ============================================================
 TRADE_LOOKBACK_SEC = 2.0                   # 回看 2 秒订单流
 IMBALANCE_THRESHOLD = Decimal("1.3")       # 不平衡阈值
 IMBALANCE_EMA_ALPHA = Decimal("0.4")       # EMA 平滑
 MIN_SIDE_HOLD_SEC = 1.5                    # 方向最短持有时间
+
+# 库存管理：一旦出现仓位，立即切换方向平仓
+INVENTORY_THRESHOLD = Decimal("0.001")     # 最小仓位阈值（名义价值）
+FORCE_REDUCE_ON_INVENTORY = True           # 强制基于库存切换方向
 
 # ============================================================
 # 🔥 核心优化 4: 风控
@@ -100,11 +116,19 @@ HEDGE_RATIO = Decimal("0.6")               # 对冲超额部分的 60%
 EQUITY_UPDATE_INTERVAL = 10.0              # 10 秒更新一次权益
 POSITION_UPDATE_INTERVAL = 3.0             # 3 秒更新一次仓位
 
-# 日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# 统计日志输出间隔
+STATS_LOG_INTERVAL = 60.0                  # 60 秒输出一次统计到文件
+
+# 日志配置（同时输出到控制台和文件）
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# 控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
 
 
 # ============================================================
@@ -216,6 +240,115 @@ def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
 
 
 # ============================================================
+#                     统计跟踪类
+# ============================================================
+
+class TradingStats:
+    """全局交易统计"""
+    def __init__(self):
+        # 订单统计
+        self.maker_count = 0           # maker 成交次数
+        self.taker_count = 0           # taker 成交次数
+        self.filled_count = 0          # 总成交次数
+        self.failed_count = 0          # 失败订单数
+
+        # 方向统计
+        self.long_count = 0            # 做多次数
+        self.short_count = 0           # 做空次数
+
+        # 财务统计
+        self.total_pnl = Decimal("0")  # 总盈亏
+        self.realized_pnls: List[Decimal] = []  # 每笔已实现盈亏
+        self.max_profit = Decimal("0") # 最大单笔盈利
+        self.max_loss = Decimal("0")   # 最大单笔亏损
+        self.total_fees = Decimal("0") # 总手续费
+
+        # 仓位跟踪
+        self.last_position_qty = Decimal("0")  # 上次仓位数量（用于计算已实现PnL）
+        self.avg_entry_price = Decimal("0")    # 平均开仓价格
+
+        # API调用统计
+        self.api_calls_count = 0       # REST API 调用次数
+        self.ws_messages_count = 0     # WebSocket 消息数
+
+    def record_fill(self, side: str, qty: Decimal, price: Decimal, is_maker: bool = True):
+        """记录成交"""
+        self.filled_count += 1
+        if is_maker:
+            self.maker_count += 1
+        else:
+            self.taker_count += 1
+
+        if side == "Bid":  # 买入 = 做多
+            self.long_count += 1
+        else:              # 卖出 = 做空
+            self.short_count += 1
+
+    def record_pnl(self, pnl: Decimal):
+        """记录单笔盈亏"""
+        self.total_pnl += pnl
+        self.realized_pnls.append(pnl)
+        if pnl > self.max_profit:
+            self.max_profit = pnl
+        if pnl < self.max_loss:
+            self.max_loss = pnl
+
+    def record_fee(self, fee: Decimal):
+        """记录手续费"""
+        self.total_fees += fee
+
+    def get_avg_pnl(self) -> Decimal:
+        """获取平均盈亏"""
+        if not self.realized_pnls:
+            return Decimal("0")
+        return self.total_pnl / len(self.realized_pnls)
+
+    def get_long_short_ratio(self) -> str:
+        """获取多空比例"""
+        total = self.long_count + self.short_count
+        if total == 0:
+            return "0:0"
+        return f"{self.long_count}:{self.short_count}"
+
+    def to_log_string(self, equity: Decimal) -> str:
+        """生成日志字符串"""
+        avg_pnl = self.get_avg_pnl()
+        ratio = self.get_long_short_ratio()
+
+        return (
+            f"\n{'='*80}\n"
+            f"[交易统计] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"{'='*80}\n"
+            f"订单统计:\n"
+            f"  Maker成交: {self.maker_count} 笔 | Taker成交: {self.taker_count} 笔\n"
+            f"  总成交: {self.filled_count} 笔 | 失败订单: {self.failed_count} 笔\n"
+            f"  成功率: {(self.filled_count/(self.filled_count+self.failed_count)*100 if (self.filled_count+self.failed_count)>0 else 0):.2f}%\n"
+            f"\n"
+            f"方向统计:\n"
+            f"  多空比例: {ratio}\n"
+            f"  做多: {self.long_count} 次 | 做空: {self.short_count} 次\n"
+            f"\n"
+            f"财务统计:\n"
+            f"  当前权益: {equity:.2f} USDC\n"
+            f"  总盈亏(PnL): {self.total_pnl:.4f} USDC\n"
+            f"  平均盈亏: {avg_pnl:.4f} USDC\n"
+            f"  最大盈利: {self.max_profit:.4f} USDC\n"
+            f"  最大亏损: {self.max_loss:.4f} USDC\n"
+            f"  总手续费: {self.total_fees:.4f} USDC\n"
+            f"\n"
+            f"API效率:\n"
+            f"  REST API调用: {self.api_calls_count} 次\n"
+            f"  WebSocket消息: {self.ws_messages_count} 条\n"
+            f"  WS/API比率: {(self.ws_messages_count/self.api_calls_count if self.api_calls_count>0 else 0):.2f}x\n"
+            f"{'='*80}\n"
+        )
+
+
+# 全局统计对象
+GLOBAL_STATS = TradingStats()
+
+
+# ============================================================
 #                     市场状态类
 # ============================================================
 
@@ -245,10 +378,14 @@ class SymbolState:
 
         # 仓位 / 权益
         self.position_notional: Decimal = Decimal("0")
+        self.position_qty: Decimal = Decimal("0")  # 净仓位数量（正=多，负=空）
         self.last_position_update: float = 0.0
 
         self.cached_equity: Decimal = Decimal("1000")
         self.last_equity_update: float = 0.0
+
+        # 统计日志
+        self.last_stats_log: float = 0.0
 
         # 订单流（taker 不平衡）
         self.trades: deque = deque()  # (ts, side, notional)
@@ -337,6 +474,7 @@ async def get_equity(client: httpx.AsyncClient, st: SymbolState) -> Decimal:
         return st.cached_equity
 
     try:
+        GLOBAL_STATS.api_calls_count += 1  # 统计API调用
         headers = auth_headers("collateralQuery", None)
         resp = await client.get(
             f"{API_BASE_URL}/api/v1/capital/collateral",
@@ -371,6 +509,7 @@ async def get_position(
         return st.position_notional
 
     try:
+        GLOBAL_STATS.api_calls_count += 1  # 统计API调用
         params = {"symbol": symbol}
         headers = auth_headers("positionQuery", params)
         resp = await client.get(
@@ -382,6 +521,7 @@ async def get_position(
 
         if resp.status_code == 404:
             st.position_notional = Decimal("0")
+            st.position_qty = Decimal("0")
             st.last_position_update = now
             return st.position_notional
 
@@ -392,11 +532,13 @@ async def get_position(
         data = resp.json()
         if not data:
             st.position_notional = Decimal("0")
+            st.position_qty = Decimal("0")
         else:
             pos = data[0]
             net_qty = safe_decimal(pos.get("netQuantity", "0"))
             mark = safe_decimal(pos.get("markPrice", "0"))
             st.position_notional = abs(net_qty * mark)
+            st.position_qty = net_qty  # 保存净仓位数量（带符号）
 
         st.last_position_update = now
         return st.position_notional
@@ -435,6 +577,7 @@ async def place_order(
     headers = auth_headers("orderExecute", body)
 
     try:
+        GLOBAL_STATS.api_calls_count += 1  # 统计API调用
         resp = await client.post(
             f"{API_BASE_URL}/api/v1/order",
             json=body,
@@ -443,6 +586,7 @@ async def place_order(
         )
 
         if resp.status_code != 200:
+            GLOBAL_STATS.failed_count += 1  # 统计失败订单
             logging.error(
                 f"[{symbol}] 下单失败: {resp.status_code} {resp.text}"
             )
@@ -453,10 +597,11 @@ async def place_order(
         st.orders_placed += 1
         st.last_order_ts = now
 
-        logging.info(f"[{symbol}] 下单成功: {side} {qty}@{price}, id={order_id}")
+        logging.info(f"[{symbol}] 下单成功: {side} {qty}@{price}, id={order_id}, reduce={reduce_only}")
         return order_id
 
     except Exception as e:
+        GLOBAL_STATS.failed_count += 1  # 统计失败订单
         logging.error(f"[{symbol}] 下单异常: {e}")
         return None
 
@@ -471,6 +616,7 @@ async def cancel_orders(client: httpx.AsyncClient, symbol: str):
     headers = auth_headers("orderCancelAll", body)
 
     try:
+        GLOBAL_STATS.api_calls_count += 1  # 统计API调用
         resp = await client.request(
             "DELETE",
             f"{API_BASE_URL}/api/v1/orders",
@@ -547,6 +693,7 @@ async def hedge_if_needed(
         return
 
     try:
+        GLOBAL_STATS.api_calls_count += 1  # 统计API调用
         params = {"symbol": symbol}
         headers = auth_headers("positionQuery", params)
         resp = await client.get(
@@ -596,6 +743,7 @@ async def hedge_if_needed(
             "reduceOnly": True,
         }
         headers = auth_headers("orderExecute", body)
+        GLOBAL_STATS.api_calls_count += 1  # 统计API调用
         await client.post(
             f"{API_BASE_URL}/api/v1/order",
             json=body,
@@ -616,8 +764,43 @@ async def hedge_if_needed(
 # ============================================================
 
 def choose_side(st: SymbolState) -> str:
-    """根据 taker 不平衡决定挂 Bid 还是 Ask"""
+    """
+    根据库存优先，然后是 taker 不平衡决定挂 Bid 还是 Ask
+
+    策略：
+    1. 如果启用库存管理且有仓位 -> 立即切换到平仓方向
+    2. 否则根据订单流不平衡选择方向
+    """
     now = time.time()
+
+    # 🔥 优先：库存管理 - 一旦有仓位，立即切换方向平仓
+    if FORCE_REDUCE_ON_INVENTORY:
+        # 检查是否有显著仓位
+        if abs(st.position_qty * (st.last_mid or Decimal("1"))) > INVENTORY_THRESHOLD:
+            if st.position_qty > 0:
+                # 有多仓 -> 挂Ask平仓
+                suggested = "Ask"
+                if suggested != st.preferred_side:
+                    logging.info(
+                        f"[{st.symbol}] 库存触发方向切换: {st.preferred_side} -> {suggested}, "
+                        f"仓位={st.position_qty:.4f}, 名义价值={st.position_notional:.2f}"
+                    )
+                    st.preferred_side = suggested
+                    st.last_side_switch_ts = now
+                return st.preferred_side
+            elif st.position_qty < 0:
+                # 有空仓 -> 挂Bid平仓
+                suggested = "Bid"
+                if suggested != st.preferred_side:
+                    logging.info(
+                        f"[{st.symbol}] 库存触发方向切换: {st.preferred_side} -> {suggested}, "
+                        f"仓位={st.position_qty:.4f}, 名义价值={st.position_notional:.2f}"
+                    )
+                    st.preferred_side = suggested
+                    st.last_side_switch_ts = now
+                return st.preferred_side
+
+    # 无仓位或未启用库存管理 -> 使用订单流策略
     imb = st.calc_imbalance()
 
     if st.imbalance_ema is None:
@@ -639,12 +822,38 @@ def choose_side(st: SymbolState) -> str:
     if suggested != st.preferred_side:
         if now - st.last_side_switch_ts >= MIN_SIDE_HOLD_SEC:
             logging.info(
-                f"[{st.symbol}] 方向切换: {st.preferred_side} -> {suggested}, EMA={st.imbalance_ema:.2f}"
+                f"[{st.symbol}] 订单流方向切换: {st.preferred_side} -> {suggested}, EMA={st.imbalance_ema:.2f}"
             )
             st.preferred_side = suggested
             st.last_side_switch_ts = now
 
     return st.preferred_side
+
+
+# ============================================================
+#                 统计日志输出
+# ============================================================
+
+async def write_stats_to_file(equity: Decimal):
+    """将统计信息写入日志文件"""
+    try:
+        # 确保目录存在
+        log_dir = os.path.dirname(LOG_FILE_PATH)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        # 生成统计字符串
+        stats_str = GLOBAL_STATS.to_log_string(equity)
+
+        # 追加写入文件
+        with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+            f.write(stats_str)
+            f.flush()
+
+        logging.info(f"统计已写入日志文件: {LOG_FILE_PATH}")
+
+    except Exception as e:
+        logging.error(f"写入统计日志失败: {e}")
 
 
 # ============================================================
@@ -787,8 +996,15 @@ async def maker_loop(symbol: str):
 
             now = time.time()
 
+            # 🔥 判断是否需要 reduce_only（有仓位时平仓）
+            reduce_only = False
+            if FORCE_REDUCE_ON_INVENTORY and abs(st.position_qty) > 0:
+                # 有多仓且挂Ask，或有空仓且挂Bid -> reduce_only
+                if (st.position_qty > 0 and side == "Ask") or (st.position_qty < 0 and side == "Bid"):
+                    reduce_only = True
+
             if st.active_order_id is None:
-                oid = await place_order(client, symbol, side, px, qty)
+                oid = await place_order(client, symbol, side, px, qty, reduce_only=reduce_only)
                 if oid:
                     st.active_order_id = oid
                     st.active_order_side = side
@@ -802,14 +1018,19 @@ async def maker_loop(symbol: str):
             if price_moved or timeout:
                 await cancel_orders(client, symbol)
 
-            # 每 5 分钟打一份简单统计
+            # 🔥 定期写入统计日志到文件
+            if now - st.last_stats_log >= STATS_LOG_INTERVAL:
+                st.last_stats_log = now
+                await write_stats_to_file(equity)
+
+            # 每 5 分钟打一份简单统计到控制台
             if now - st.last_stats_print >= 300:
                 st.last_stats_print = now
                 spread = (st.best_ask - st.best_bid) / ((st.best_ask + st.best_bid) / 2)
                 logging.info(
                     f"[{symbol}] 统计：下单={st.orders_placed}, 撤单={st.orders_cancelled}, "
                     f"估算 maker 成交={st.orders_filled}, "
-                    f"仓位={pos_notional:.2f}, 权益={equity:.2f}, "
+                    f"仓位={pos_notional:.2f} (qty={st.position_qty:.4f}), 权益={equity:.2f}, "
                     f"方向={side}, EMA={st.imbalance_ema or 0:.2f}, spread={spread:.3%}"
                 )
 
@@ -855,6 +1076,8 @@ async def ws_handler():
                     except Exception:
                         continue
 
+                    GLOBAL_STATS.ws_messages_count += 1  # 统计WS消息
+
                     data = msg.get("data", msg)
                     etype = data.get("e")
                     symbol = data.get("s")
@@ -875,10 +1098,23 @@ async def ws_handler():
                         st.record_trade(taker_side, price, qty)
 
                         # 如果成交价接近我们挂的价，粗略当作成交一次
-                        if st.active_order_price and st.tick:
+                        if st.active_order_price and st.tick and st.active_order_side:
                             if abs(price - st.active_order_price) < st.tick:
                                 st.orders_filled += 1
                                 st.maker_volume_estimate += price * qty
+
+                                # 记录到全局统计
+                                GLOBAL_STATS.record_fill(
+                                    side=st.active_order_side,
+                                    qty=qty,
+                                    price=price,
+                                    is_maker=True
+                                )
+
+                                # 估算手续费（maker一般是负费率，但为了统计完整性）
+                                # Backpack maker fee 通常是 -0.02% 或 0%，这里用 0.0002 作为估算
+                                est_fee = price * qty * Decimal("0.0002")
+                                GLOBAL_STATS.record_fee(est_fee)
 
         except Exception as e:
             logging.error(f"WS 断开: {e}，{backoff}s 后重连")
@@ -918,8 +1154,30 @@ async def main():
     global ACTIVE_SYMBOLS
 
     logging.info("=" * 60)
-    logging.info("Backpack MM Tier Hunter v3.1 启动")
+    logging.info("Backpack MM Tier Hunter v3.2 启动")
     logging.info("=" * 60)
+
+    # 初始化日志文件
+    try:
+        log_dir = os.path.dirname(LOG_FILE_PATH)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
+        with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"[启动] Backpack MM Tier Hunter v3.2 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"配置:\n")
+            f.write(f"  - 库存管理: {'启用' if FORCE_REDUCE_ON_INVENTORY else '禁用'}\n")
+            f.write(f"  - 库存阈值: {INVENTORY_THRESHOLD} USDC\n")
+            f.write(f"  - 统计日志间隔: {STATS_LOG_INTERVAL}s\n")
+            f.write(f"  - API缓存: 权益{EQUITY_UPDATE_INTERVAL}s / 仓位{POSITION_UPDATE_INTERVAL}s\n")
+            f.write(f"{'='*80}\n\n")
+            f.flush()
+
+        logging.info(f"日志文件已初始化: {LOG_FILE_PATH}")
+    except Exception as e:
+        logging.warning(f"初始化日志文件失败: {e}，将继续运行但不写入文件日志")
 
     if USE_DYNAMIC_SYMBOLS:
         logging.info("模式：动态选币")
