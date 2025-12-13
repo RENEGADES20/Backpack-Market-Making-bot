@@ -13,7 +13,10 @@ Backpack MM Tier Hunter v3.2  （单文件可直接运行）
 - ✅ 完整日志：输出到 D:\ALLCRYPTO\backpack mm\pythonProject\log.txt
   包含：maker/taker数量、成交/失败数量、long/short比例、权益、
   总PnL、平均PnL、最大获利/亏损、总手续费
-- ✅ 库存管理：一旦出现仓位，立即切换方向用 limit order 平仓（单边做市）
+- ✅ 智能库存管理（双轨制）：
+  * 无仓位：按订单流逻辑做市
+  * 有仓位：继续做市 + 额外挂limit平仓单在best档位（两单并行）
+  * 仓位过大：用taker强制平仓
 - ✅ 统计追踪：全局统计对象追踪所有交易指标
 
 当前默认只做：SOL_USDC_PERP
@@ -369,12 +372,18 @@ class SymbolState:
         self.last_mid: Optional[Decimal] = None
         self.last_mid_ts: Optional[float] = None
 
-        # 挂单状态
+        # 挂单状态（做市单）
         self.active_order_id: Optional[str] = None
         self.active_order_side: Optional[str] = None
         self.active_order_price: Optional[Decimal] = None
         self.active_order_ts: Optional[float] = None
         self.last_order_ts: Optional[float] = None
+
+        # 平仓单状态（库存管理）
+        self.reduce_order_id: Optional[str] = None
+        self.reduce_order_side: Optional[str] = None
+        self.reduce_order_price: Optional[Decimal] = None
+        self.reduce_order_ts: Optional[float] = None
 
         # 仓位 / 权益
         self.position_notional: Decimal = Decimal("0")
@@ -555,8 +564,9 @@ async def place_order(
     price: Decimal,
     qty: Decimal,
     reduce_only: bool = False,
+    post_only: bool = True,
 ) -> Optional[str]:
-    """POST /api/v1/order 下限价单（post-only）"""
+    """POST /api/v1/order 下限价单"""
     st = MARKETS[symbol]
 
     now = time.time()
@@ -570,7 +580,7 @@ async def place_order(
         "price": str(price),
         "quantity": str(qty),
         "timeInForce": "GTC",
-        "postOnly": True,             # 只做 maker
+        "postOnly": post_only,        # 平仓单可设为False
         "reduceOnly": reduce_only,
     }
 
@@ -765,42 +775,11 @@ async def hedge_if_needed(
 
 def choose_side(st: SymbolState) -> str:
     """
-    根据库存优先，然后是 taker 不平衡决定挂 Bid 还是 Ask
+    根据 taker 不平衡决定挂 Bid 还是 Ask（纯订单流策略）
 
-    策略：
-    1. 如果启用库存管理且有仓位 -> 立即切换到平仓方向
-    2. 否则根据订单流不平衡选择方向
+    注意：库存管理通过独立的平仓单处理，不影响做市方向
     """
     now = time.time()
-
-    # 🔥 优先：库存管理 - 一旦有仓位，立即切换方向平仓
-    if FORCE_REDUCE_ON_INVENTORY:
-        # 检查是否有显著仓位
-        if abs(st.position_qty * (st.last_mid or Decimal("1"))) > INVENTORY_THRESHOLD:
-            if st.position_qty > 0:
-                # 有多仓 -> 挂Ask平仓
-                suggested = "Ask"
-                if suggested != st.preferred_side:
-                    logging.info(
-                        f"[{st.symbol}] 库存触发方向切换: {st.preferred_side} -> {suggested}, "
-                        f"仓位={st.position_qty:.4f}, 名义价值={st.position_notional:.2f}"
-                    )
-                    st.preferred_side = suggested
-                    st.last_side_switch_ts = now
-                return st.preferred_side
-            elif st.position_qty < 0:
-                # 有空仓 -> 挂Bid平仓
-                suggested = "Bid"
-                if suggested != st.preferred_side:
-                    logging.info(
-                        f"[{st.symbol}] 库存触发方向切换: {st.preferred_side} -> {suggested}, "
-                        f"仓位={st.position_qty:.4f}, 名义价值={st.position_notional:.2f}"
-                    )
-                    st.preferred_side = suggested
-                    st.last_side_switch_ts = now
-                return st.preferred_side
-
-    # 无仓位或未启用库存管理 -> 使用订单流策略
     imb = st.calc_imbalance()
 
     if st.imbalance_ema is None:
@@ -828,6 +807,141 @@ def choose_side(st: SymbolState) -> str:
             st.last_side_switch_ts = now
 
     return st.preferred_side
+
+
+# ============================================================
+#                 库存管理 - 独立平仓单
+# ============================================================
+
+async def manage_inventory_reduce_order(
+    client: httpx.AsyncClient,
+    symbol: str,
+    st: SymbolState,
+):
+    """
+    库存管理：如果有仓位，挂一个独立的limit平仓单在best档位
+
+    策略：
+    - 有多仓 -> 在best_bid挂Ask平仓单
+    - 有空仓 -> 在best_ask挂Bid平仓单
+    - 平仓单独立于做市单管理
+    """
+    now = time.time()
+
+    if not FORCE_REDUCE_ON_INVENTORY:
+        return
+
+    # 检查是否有显著仓位
+    if abs(st.position_qty * (st.last_mid or Decimal("1"))) <= INVENTORY_THRESHOLD:
+        # 无仓位，如果有平仓单则撤销
+        if st.reduce_order_id:
+            await cancel_reduce_order(client, symbol, st)
+        return
+
+    # 确定平仓方向和价格（挂在best档位，容易成交）
+    if st.position_qty > 0:
+        # 多仓 -> 卖出平仓 -> 挂Ask在best_ask（卖1价），成为新的卖1
+        reduce_side = "Ask"
+        reduce_price = st.best_ask if st.best_ask else st.last_mid
+    else:
+        # 空仓 -> 买入平仓 -> 挂Bid在best_bid（买1价），成为新的买1
+        reduce_side = "Bid"
+        reduce_price = st.best_bid if st.best_bid else st.last_mid
+
+    if not reduce_price or reduce_price <= 0:
+        return
+
+    # 计算平仓数量（平掉全部仓位）
+    reduce_qty = abs(st.position_qty)
+    if st.qty_step:
+        reduce_qty = round_down(reduce_qty, st.qty_step)
+    if st.min_qty and reduce_qty < st.min_qty:
+        return
+
+    # 检查是否需要更新平仓单
+    need_new_order = False
+
+    if st.reduce_order_id is None:
+        need_new_order = True
+    else:
+        # 检查价格是否变化
+        if st.reduce_order_price and st.tick:
+            price_moved = abs(reduce_price - st.reduce_order_price) >= st.tick
+            if price_moved:
+                await cancel_reduce_order(client, symbol, st)
+                need_new_order = True
+
+        # 检查方向是否变化
+        if st.reduce_order_side != reduce_side:
+            await cancel_reduce_order(client, symbol, st)
+            need_new_order = True
+
+        # 检查超时
+        if st.reduce_order_ts and now - st.reduce_order_ts > MAX_ORDER_LIFETIME_SEC:
+            await cancel_reduce_order(client, symbol, st)
+            need_new_order = True
+
+    # 下新的平仓单（postOnly=False允许立即成交）
+    if need_new_order:
+        oid = await place_order(
+            client, symbol, reduce_side,
+            reduce_price, reduce_qty,
+            reduce_only=True,
+            post_only=False  # 允许穿价成交
+        )
+        if oid:
+            st.reduce_order_id = oid
+            st.reduce_order_side = reduce_side
+            st.reduce_order_price = reduce_price
+            st.reduce_order_ts = now
+            logging.info(
+                f"[{symbol}] 平仓单: {reduce_side} {reduce_qty}@{reduce_price}, "
+                f"仓位={st.position_qty:.4f}"
+            )
+
+
+async def cancel_single_order(
+    client: httpx.AsyncClient,
+    symbol: str,
+    order_id: str,
+) -> bool:
+    """撤销单个订单（通过订单ID）"""
+    body = {
+        "symbol": symbol,
+        "orderId": order_id,
+    }
+    headers = auth_headers("orderCancel", body)
+
+    try:
+        GLOBAL_STATS.api_calls_count += 1
+        resp = await client.request(
+            "DELETE",
+            f"{API_BASE_URL}/api/v1/order",
+            json=body,
+            headers=headers,
+            timeout=10,
+        )
+        return resp.status_code in (200, 202)
+    except Exception as e:
+        logging.error(f"[{symbol}] 撤销订单 {order_id} 异常: {e}")
+        return False
+
+
+async def cancel_reduce_order(
+    client: httpx.AsyncClient,
+    symbol: str,
+    st: SymbolState,
+):
+    """撤销平仓单（只撤销平仓单，不影响做市单）"""
+    if not st.reduce_order_id:
+        return
+
+    success = await cancel_single_order(client, symbol, st.reduce_order_id)
+    if success:
+        st.reduce_order_id = None
+        st.reduce_order_side = None
+        st.reduce_order_price = None
+        st.reduce_order_ts = None
 
 
 # ============================================================
@@ -996,15 +1110,12 @@ async def maker_loop(symbol: str):
 
             now = time.time()
 
-            # 🔥 判断是否需要 reduce_only（有仓位时平仓）
-            reduce_only = False
-            if FORCE_REDUCE_ON_INVENTORY and abs(st.position_qty) > 0:
-                # 有多仓且挂Ask，或有空仓且挂Bid -> reduce_only
-                if (st.position_qty > 0 and side == "Ask") or (st.position_qty < 0 and side == "Bid"):
-                    reduce_only = True
+            # 🔥 库存管理：独立平仓单（不影响做市逻辑）
+            await manage_inventory_reduce_order(client, symbol, st)
 
+            # 做市单逻辑
             if st.active_order_id is None:
-                oid = await place_order(client, symbol, side, px, qty, reduce_only=reduce_only)
+                oid = await place_order(client, symbol, side, px, qty, reduce_only=False)
                 if oid:
                     st.active_order_id = oid
                     st.active_order_side = side
