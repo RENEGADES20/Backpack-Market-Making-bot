@@ -906,22 +906,27 @@ async def cancel_single_order(
     order_id: str,
 ) -> bool:
     """撤销单个订单（通过订单ID）"""
-    body = {
+    params = {
         "symbol": symbol,
         "orderId": order_id,
     }
-    headers = auth_headers("orderCancel", body)
+    headers = auth_headers("orderCancel", params)
 
     try:
         GLOBAL_STATS.api_calls_count += 1
         resp = await client.request(
             "DELETE",
             f"{API_BASE_URL}/api/v1/order",
-            json=body,
+            params=params,  # 使用 params 而不是 json
             headers=headers,
             timeout=10,
         )
-        return resp.status_code in (200, 202)
+        if resp.status_code in (200, 202):
+            logging.info(f"[{symbol}] 成功撤销订单: {order_id}")
+            return True
+        else:
+            logging.warning(f"[{symbol}] 撤销订单失败: {resp.status_code} {resp.text}")
+            return False
     except Exception as e:
         logging.error(f"[{symbol}] 撤销订单 {order_id} 异常: {e}")
         return False
